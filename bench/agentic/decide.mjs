@@ -32,7 +32,7 @@ if (!process.env.JEV_API_KEY && !process.env.TYPESAFE_API_KEY) {
 
 const { askJev } = await import("../../src/router.mjs");
 const { decide } = await import("../../src/policy.mjs");
-const { availableTiers } = await import("../../src/config.mjs");
+const { availableTiers, TIERS } = await import("../../src/config.mjs");
 
 const arg = (k, d) => {
   const i = process.argv.indexOf(k);
@@ -61,6 +61,33 @@ const done = new Set(readJsonl(OUT).map((d) => d.task));
 const queue = readJsonl(TASKS).filter((t) => t.keep === true && !done.has(t.id));
 const available = availableTiers();
 
+/**
+ * `decide()` takes per-tier cost snapshots, not a raw token count, and refuses every
+ * downgrade as "cost-unavailable" when they are missing -- which silently turns the shipped
+ * policy into always-stay. These reconstruct the shape `estimateInput()` returns in the
+ * proxy, from the context size actually measured during the replay.
+ *
+ * The incumbent is warm and the target is cold, which is the real situation a downgrade
+ * faces: the prompt cache has to be rebuilt on the tier being switched to. That asymmetry is
+ * the entire question the policy is weighing, so flattening it would beg it.
+ */
+const costFor = (name, contextTokens, warm) => {
+  const spec = TIERS.find((t) => t.name === name);
+  if (!spec) return null;
+  const cacheable = contextTokens >= spec.minCacheTokens ? contextTokens : 0;
+  return {
+    model: spec.id,
+    tokens: contextTokens,
+    cacheable,
+    read: warm ? cacheable : 0,
+    oneHour: 0,
+    ttl: "5m",
+    unknown: false,
+    supported: true,
+    minimum: spec.minCacheTokens,
+  };
+};
+
 console.log(`${queue.length} tasks to decide; tiers=${available.join(",")}`);
 let n = 0;
 let failed = 0;
@@ -79,7 +106,15 @@ await Promise.all(
         failed++;
         continue;
       }
-      const { tier, reason } = decide({ prompt: t.prompt, jev, current, available, contextTokens });
+      const { tier, reason } = decide({
+        prompt: t.prompt,
+        jev,
+        current,
+        available,
+        costs: Object.fromEntries(
+          available.map((name) => [name, costFor(name, contextTokens, name === current)]),
+        ),
+      });
       appendFileSync(
         OUT,
         JSON.stringify({

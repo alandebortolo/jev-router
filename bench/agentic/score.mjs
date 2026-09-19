@@ -188,7 +188,8 @@ const policies = [
   evaluate(`length @ ${(jevRate * 100).toFixed(0)}%`, (r) => r.prompt.length >= (lenCut?.prompt.length ?? Infinity)),
   evaluate("always cheap", () => false),
   evaluate("always strong", () => true),
-  evaluate("oracle", (r) => r.worth),
+  evaluate("oracle (quality)", (r) => r.worth),
+  evaluate("oracle (qual+cost)", (r) => r.worth || r.costStrong < r.costCheap),
 ];
 
 const alwaysStrong = policies.find((p) => p.name === "always strong").cost;
@@ -206,6 +207,16 @@ console.log(
   `\nquality = share of tasks where the chosen tier was not materially worse.` +
     `\nregret  = cheap was chosen but the strong answer was materially better.` +
     `\nwaste   = strong was chosen but bought nothing.`,
+);
+
+// Downgrading is not automatically cheaper: a weak model that flails burns more turns, and
+// more turns on a cheap model can cost more than a few turns on an expensive one. If this
+// share is high, the premise of cost-saving routing is in trouble on agentic work.
+const cheapCostsMore = rows.filter((r) => r.costCheap > r.costStrong).length;
+const ratio = rows.reduce((a, r) => a + r.costCheap, 0) / rows.reduce((a, r) => a + r.costStrong, 0);
+console.log(
+  `\ncheap tier cost MORE than strong on ${cheapCostsMore}/${n} tasks ` +
+    `(${((cheapCostsMore / n) * 100).toFixed(0)}%); all-cheap is ${((1 - ratio) * 100).toFixed(0)}% cheaper overall`,
 );
 
 // The only comparison that can falsify the router: does it beat a coin weighted to escalate
