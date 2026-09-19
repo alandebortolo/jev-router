@@ -40,7 +40,12 @@ export async function askJev({ prompt, current, contextTokens, available }) {
       { signal: abort.signal },
     );
     const answer = result.answers.model_tier;
-    return { ...answer, ms: Date.now() - started };
+    return {
+      ...answer,
+      workload: result.answers.workload,
+      contextDependence: result.answers.context_dependence,
+      ms: Date.now() - started,
+    };
   } catch (err) {
     log(`routing failed, keeping ${current}: ${err.message}`);
     return null;

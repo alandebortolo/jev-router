@@ -2,12 +2,14 @@ import http from "node:http";
 import https from "node:https";
 import { createHash } from "node:crypto";
 import { writeFileSync } from "node:fs";
+import { createGunzip, createInflate, createBrotliDecompress } from "node:zlib";
 import { tierOf, idOf, availableTiers, tierSpec, isAuto } from "./config.mjs";
 import { askJev } from "./router.mjs";
 import { decide } from "./policy.mjs";
 import { log } from "./log.mjs";
 import { writeStatus } from "./status.mjs";
-import { usageEnabled, usageRecord, recordUsage } from "./usage.mjs";
+import { usageEnabled, usageRecord, recordUsage, createUsageCollector } from "./usage.mjs";
+import { snapshotRequest, observeCache, estimateInput } from "./cache.mjs";
 
 const UPSTREAM = "api.anthropic.com";
 const debug = (line) => process.env.JEV_DEBUG && log(line);
@@ -126,6 +128,10 @@ export function sessionOf(body) {
 
 export function conversationKey(body) {
   const session = sessionOf(body);
+  let agent = body?.metadata?.agent_id ?? "";
+  try {
+    agent ||= JSON.parse(body?.metadata?.user_id ?? "{}").agent_id ?? "";
+  } catch { /* sessionOf handles legacy non-JSON metadata too */ }
   const content = body?.messages?.[0]?.content;
   const text =
     typeof content === "string"
@@ -136,7 +142,7 @@ export function conversationKey(body) {
             .map((b) => b.text)
             .join("")
         : "";
-  return createHash("sha1").update(`${session}|${text}`).digest("hex").slice(0, 12);
+  return createHash("sha1").update(JSON.stringify([session, agent, text])).digest("hex").slice(0, 12);
 }
 
 /**
@@ -152,14 +158,17 @@ export function observeModel(state, current) {
 }
 
 
-export async function startProxy() {
+export async function startProxy({ route = askJev, upstreamRequest = https.request, now = Date.now, publish = writeStatus } = {}) {
   // Tier routed for each conversation's turn in flight, reused by its follow-up requests and
   // by the cache-rebuild guard, which needs to know what the prompt cache was built on.
   const convos = new Map();
   const stateFor = (key) => {
     let s = convos.get(key);
     if (!s) {
-      if (convos.size > 50) convos.delete(convos.keys().next().value);
+      if (convos.size >= 50) {
+        const idle = [...convos].find(([, state]) => !state.inflight && !state.routing);
+        if (idle) convos.delete(idle[0]);
+      }
       convos.set(key, (s = { tier: null }));
     }
     return s;
@@ -176,8 +185,10 @@ export async function startProxy() {
       // Carried into the response handler so the ledger can attribute tokens to the routing
       // decision that produced them.
       const meta = { messages: /^\/v1\/messages/.test(req.url ?? ""), routed: false, requested: null, tier: null, reason: null, session: "", key: null };
+      let state;
+      let snapshot;
 
-      if (meta.messages) {
+      if (meta.messages && req.method === "POST" && !req.url.includes("count_tokens")) {
         try {
           const body = JSON.parse(out.toString());
           meta.requested = body.model ?? null;
@@ -187,6 +198,12 @@ export async function startProxy() {
             writeFileSync(`${process.env.JEV_DUMP}.${Date.now()}.json`, JSON.stringify(body, null, 2));
           }
           body.tools?.forEach((t) => sanitizeSchema(t.input_schema));
+          const agentRequest = Array.isArray(body.tools) && body.tools.length > 0;
+          if (agentRequest || isAuto(body.model)) {
+            meta.key = conversationKey(body);
+            state = stateFor(meta.key);
+            if (state.networkComplete) await state.feedback;
+          }
 
           // Anything that is not the sentinel is a model the user chose, and an explicit
           // choice beats the router. That also covers Claude Code's own cheap Haiku calls
@@ -196,15 +213,16 @@ export async function startProxy() {
             // Only a real agent turn reflects the user's choice. Claude Code's own auxiliary
             // calls carry no tools and must not flip the status line to manual mid-session.
             if (Array.isArray(body.tools)) {
-              writeStatus(sessionOf(body), { manual: true, at: Date.now() });
+              state.turn = null;
+              state.decision = null;
+              publish(sessionOf(body), { manual: true, at: now() });
             }
           } else {
-            const key = conversationKey(body);
-            const state = stateFor(key);
+            const key = meta.key;
             meta.routed = true;
             meta.key = key;
             // What the prompt cache was built on, which is what a downgrade would discard.
-            const current = state.tier ?? "sonnet";
+            const current = state.servedTier ?? state.tier ?? "sonnet";
             const prompt = newTurnPrompt(body);
             let fresh = null;
             // Evaluation harnesses need to pin a tier to compare tiers on identical turns.
@@ -215,16 +233,36 @@ export async function startProxy() {
               state.tier = forced;
               fresh = { confidence: null, reason: "forced" };
             } else if (prompt) {
-              const available = availableTiers();
-              const contextTokens = Math.round(JSON.stringify(body.messages).length / 4);
-              const jev = await askJev({ prompt, current, contextTokens, available });
-              const { tier, reason } = decide({ prompt, jev, current, available, contextTokens });
-              state.tier = tier;
-              fresh = { confidence: jev?.confidence ?? null, reason };
-              debug(
-                `${key} ${jev ? `${jev.ms}ms p=${jev.confidence.toFixed(2)}` : "no-jev"} ` +
-                  `${current} -> ${tier} (${reason}) ctx~${contextTokens} | ${prompt.slice(0, 60)}`,
-              );
+              const turn = snapshotRequest(body).fingerprint;
+              if (state.turn === turn && state.decision) {
+                fresh = await state.decision;
+              } else if (state.inflight || state.routing) {
+                // Without distinct agent metadata, a simultaneous fork is ambiguous.
+                fresh = { confidence: null, reason: "concurrent-conversation-pinned" };
+              } else {
+                state.turn = turn;
+                state.routing = true;
+                state.decision = (async () => {
+                  const available = availableTiers();
+                  const hasHistory = body.messages.some((m) => m.role === "assistant");
+                  const costs = {};
+                  for (const name of new Set([...available, current])) {
+                    const candidate = applyTier(structuredClone(body), name);
+                    costs[name] = estimateInput(state, snapshotRequest(candidate, req.headers), now(),
+                      { incumbent: name === current, hasHistory });
+                  }
+                  const contextTokens = costs[current].tokens;
+                  let jev;
+                  try { jev = await route({ prompt, current, contextTokens, available }); }
+                  catch (err) { log(`routing failed, keeping ${current}: ${err.message}`); }
+                  const result = decide({ prompt, jev, current, available, hasHistory, costs });
+                  state.tier = result.tier;
+                  debug(`${key} ${current} -> ${result.tier} (${result.reason}) ctx~${contextTokens}`);
+                  return { confidence: jev?.confidence ?? null, reason: result.reason, estimate: result.estimate ?? null };
+                })();
+                try { fresh = await state.decision; }
+                finally { state.routing = false; }
+              }
             }
             // The sentinel is not a real model, so every routed request must be rewritten,
             // including follow-ups that reuse the tier chosen for the turn.
@@ -232,11 +270,14 @@ export async function startProxy() {
             debug(`${key} rewrite ${body.model} -> ${idOf(tier)}`);
             applyTier(body, tier);
             meta.tier = tier;
+            meta.turn = state.turn;
+            meta.estimate = fresh?.estimate;
             meta.reason = fresh?.reason ?? "pinned";
             // Publish what went out. Claude Code's UI shows the row you picked, not the tier
             // it resolved to, so the status line is the only place this is visible.
-            writeStatus(sessionOf(body), { tier, ...fresh, at: Date.now() });
+            publish(sessionOf(body), { tier, ...fresh, at: now() });
           }
+          if (state) snapshot = snapshotRequest(body, req.headers);
           out = Buffer.from(JSON.stringify(body));
         } catch (err) {
           debug(`passthrough, could not process body: ${err.message}`);
@@ -247,10 +288,26 @@ export async function startProxy() {
       delete headers["content-length"];
       // Both the model echo and token accounting need to read the response body, which is
       // only possible uncompressed. Worth the bandwidth only when one of them is asked for.
-      if (process.env.JEV_DEBUG || usageEnabled()) delete headers["accept-encoding"];
-      const upstream = https.request(
+      const capture = snapshot != null || usageEnabled() || process.env.JEV_DEBUG;
+      if (capture) delete headers["accept-encoding"];
+      meta.startedAt = new Date(now()).toISOString();
+      const startedAt = now();
+      let resolveFeedback;
+      if (state) {
+        state.inflight = (state.inflight ?? 0) + 1;
+        state.networkComplete = false;
+        state.feedback = new Promise((resolve) => { resolveFeedback = resolve; });
+      }
+      let finished = false;
+      const release = () => {
+        if (!finished && state) state.inflight--;
+        finished = true;
+        resolveFeedback?.();
+      };
+      const upstream = upstreamRequest(
         { hostname: UPSTREAM, path: req.url, method: req.method, headers },
         (up) => {
+          up.on("end", () => { if (state) state.networkComplete = true; });
           res.writeHead(up.statusCode, up.headers);
           // Report the model the API itself says it used, so the routing can be confirmed
           // from the wire rather than trusted from our own decision log. Claude Code's UI
@@ -265,24 +322,48 @@ export async function startProxy() {
               debug(`${up.statusCode} served by ${m[1]}`);
             });
           }
-          if (usageEnabled() && meta.messages) {
-            const seen = [];
-            up.on("data", (c) => seen.push(c));
-            up.on("end", () => {
+          if (capture && meta.messages) {
+            const collector = createUsageCollector();
+            const encoding = up.headers["content-encoding"];
+            const decompress = { gzip: createGunzip, deflate: createInflate, br: createBrotliDecompress }[encoding];
+            const readable = decompress ? up.pipe(decompress()) : up;
+            const supported = !encoding || encoding === "identity" || !!decompress;
+            if (!supported) log(`usage unavailable: unsupported content encoding ${encoding}`);
+            readable.on("data", (c) => { if (supported) collector.write(c); });
+            readable.on("error", (err) => {
+              log(`usage unavailable: ${err.message}`);
+              release();
+            });
+            readable.on("end", () => {
+              const usage = supported ? collector.finish() : null;
+              if (snapshot && state) {
+                observeCache(state, snapshot, usage, up.statusCode, startedAt);
+                if (usage?.complete && usage.valid && up.statusCode >= 200 && up.statusCode < 300) {
+                  state.servedTier = tierOf(usage.model) ?? state.servedTier;
+                } else {
+                  log(`no cache evidence for ${meta.key}: incomplete or failed response`);
+                }
+              }
               const { messages, ...decision } = meta;
-              recordUsage(
+              if (usageEnabled()) recordUsage(
                 usageRecord({
-                  text: Buffer.concat(seen).toString("utf8"),
+                  usage,
                   status: up.statusCode,
+                  fallbackTtl: snapshot?.fallbackTtl,
                   ...decision,
                 }),
               );
+              release();
             });
           }
+          up.on("aborted", () => { log("upstream response aborted"); release(); res.destroy(); });
+          up.on("error", (err) => { log(`upstream response failed: ${err.message}`); release(); res.destroy(); });
+          if (!capture) up.on("end", release);
           up.pipe(res);
         },
       );
       upstream.on("error", (e) => {
+        release();
         debug(`upstream error: ${e.message}`);
         if (!res.headersSent) res.writeHead(502, { "content-type": "application/json" });
         res.end(JSON.stringify({ type: "error", error: { message: e.message } }));
@@ -293,5 +374,5 @@ export async function startProxy() {
   });
 
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-  return { port: server.address().port, close: () => server.close() };
+  return { port: server.address().port, close: () => new Promise((resolve) => server.close(resolve)) };
 }

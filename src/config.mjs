@@ -9,10 +9,10 @@ import { choice } from "@typesafe-ai/sdk";
  * those fields have to be stripped when routing down to it.
  */
 export const TIERS = [
-  { name: "haiku", id: "claude-haiku-4-5-20251001", family: "haiku", thinking: false, effort: false },
-  { name: "sonnet", id: "claude-sonnet-5", family: "sonnet", thinking: true, effort: true },
-  { name: "opus", id: "claude-opus-5", family: "opus", thinking: true, effort: true },
-  { name: "fable", id: "claude-fable-5-1", family: "fable", thinking: true, effort: true },
+  { name: "haiku", id: "claude-haiku-4-5-20251001", family: "haiku", thinking: false, effort: false, minCacheTokens: 4096 },
+  { name: "sonnet", id: "claude-sonnet-5", family: "sonnet", thinking: true, effort: true, minCacheTokens: 1024 },
+  { name: "opus", id: "claude-opus-5", family: "opus", thinking: true, effort: true, minCacheTokens: 512 },
+  { name: "fable", id: "claude-fable-5-1", family: "fable", thinking: true, effort: true, minCacheTokens: 512 },
 ];
 
 export const TIER_NAMES = TIERS.map((t) => t.name);
@@ -50,12 +50,10 @@ export const THRESHOLDS = {
   minConfidence: 0.6,
   /** Safest tier to land on when Jev is unsure. */
   uncertainCeiling: "sonnet",
-  /**
-   * Switching models invalidates the prompt cache; the next turn re-sends the whole
-   * conversation. Measured at ~23.6k cache-creation tokens switching into Opus, so a
-   * downgrade only pays off while the conversation is still small.
-   */
-  downgradeMaxContextTokens: 20000,
+  /** Require savings in every scenario, with room for extra work on the cheaper model. */
+  savingsMargin: 0.2,
+  /** Bounds around the character-based estimate, calibrated with observed input usage. */
+  contextUncertainty: 0.2,
   /**
    * Per-attempt Jev HTTP timeout and the hard wall-clock deadline for the whole routing
    * call. Measured: ~300-350ms warm, ~900-1000ms on the first call (TLS handshake), so the
@@ -64,6 +62,15 @@ export const THRESHOLDS = {
   jevTimeoutMs: 1500,
   jevDeadlineMs: 3000,
   jevMaxRetries: 1,
+};
+
+// ponytail: bootstrap workload ranges, not calibrated forecasts; replace with episode
+// quantiles once held-out session measurements justify them. Output is total per episode.
+export const WORKLOADS = {
+  short: [{ requests: 1, output: 128, growth: 128 }, { requests: 2, output: 1024, growth: 512 }],
+  bounded: [{ requests: 4, output: 2000, growth: 512 }, { requests: 10, output: 8000, growth: 1024 }],
+  long_output: [{ requests: 1, output: 2000, growth: 128 }, { requests: 2, output: 8000, growth: 512 }],
+  uncertain: [{ requests: 1, output: 128, growth: 128 }, { requests: 8, output: 4000, growth: 1024 }],
 };
 
 /** Phrases that mean "the human already decided", checked against the raw prompt. */
@@ -77,6 +84,7 @@ export const QUESTIONS = {
     [
       "Pick the cheapest Claude model tier that can fully complete this coding request in one pass, without a retry on a stronger model.",
       "Judge the reasoning the request demands, not the length of the reply it asks for. A request that wants a one-line answer to a hard debugging or design question still needs a strong model; a request for a long but mechanical edit does not.",
+      "Keeping session.current_model is a valid choice. Escalate for a material capability benefit, not because an expensive model might write a nicer answer. Do not infer missing history from a short follow-up.",
     ],
     {
       haiku: {
@@ -115,6 +123,22 @@ export const QUESTIONS = {
         ],
         not_for: "Anything a single focused session on Opus would finish. Costs extra usage credits.",
       },
+    },
+  ),
+  workload: choice(
+    "Classify the work in THIS user turn, including its model/tool round trips, not hypothetical future user prompts. Do not calculate prices or predict exact token counts.",
+    {
+      short: "A short answer, lookup, or one obvious command.",
+      bounded: "A self-contained implementation or mechanical task with several tool rounds and clear acceptance criteria.",
+      long_output: "A substantial requested document or code output, with little investigation.",
+      uncertain: "Open-ended investigation or insufficient information to predict the work.",
+    },
+  ),
+  context_dependence: choice(
+    "Could this request be understood on its own? We do not send you the conversation history. Treat 'continue', 'implement that', corrections and approvals referring to prior work as dependent, regardless of their length.",
+    {
+      standalone: "The prompt supplies enough task intent to judge capability independently.",
+      dependent: "Essential task intent or constraints come from the unseen conversation.",
     },
   ),
 };

@@ -2,10 +2,8 @@
  * List API prices, used as a common yardstick for what a routed session would have cost.
  *
  * Subscription users do not pay per token, so treat these as "equivalent API spend" rather
- * than a bill. The four token classes are priced separately on purpose: switching model
- * invalidates the prompt cache, so a downgrade re-pays cache *creation* at 1.25x input on
- * the new model instead of reading at 0.1x. Costing a switch with a single blended
- * per-token number reports savings that do not exist.
+ * than a bill. Cache writes have different prices for five-minute and one-hour TTLs.
+ * A cold destination pays for creation rather than a read; an expired incumbent does too.
  *
  * Source: https://platform.claude.com/docs/en/build-with-claude/prompt-caching
  */
@@ -37,15 +35,19 @@ export function priceOf(model) {
  * shows up as missing data instead of silently understating a total.
  *
  * @param {string} model
- * @param {{input?: number, cacheRead?: number, cacheCreate?: number, output?: number}} usage
+ * @param {{input?: number, cacheRead?: number, cacheCreate?: number, cacheCreate1h?: number, output?: number}} usage
  */
 export function costOf(model, usage = {}) {
   const p = priceOf(model);
   if (!p) return null;
+  const values = [usage.input ?? 0, usage.cacheRead ?? 0, usage.cacheCreate ?? 0,
+    usage.cacheCreate1h ?? 0, usage.output ?? 0];
+  if (values.some((v) => !Number.isFinite(v) || v < 0) || values[3] > values[2]) return null;
   const m = 1e6;
   return (
     ((usage.input ?? 0) * p.input +
-      (usage.cacheCreate ?? 0) * p.cacheWrite +
+      ((usage.cacheCreate ?? 0) - (usage.cacheCreate1h ?? 0)) * p.cacheWrite +
+      (usage.cacheCreate1h ?? 0) * p.input * 2 +
       (usage.cacheRead ?? 0) * p.cacheRead +
       (usage.output ?? 0) * p.output) /
     m

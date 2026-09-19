@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { priceOf, costOf } from "../src/pricing.mjs";
-import { parseUsage, usageRecord } from "../src/usage.mjs";
+import { parseUsage, usageRecord, createUsageCollector } from "../src/usage.mjs";
 
 test("prices the current model line", () => {
   assert.equal(priceOf("claude-haiku-4-5-20251001").input, 1);
@@ -106,4 +106,59 @@ test("ledger row records an unpriced model as null cost, not zero", () => {
   const row = usageRecord({ text: '{"model":"mystery-1","usage":{"input_tokens":5}}', status: 200, routed: false });
   assert.equal(row.served, "mystery-1");
   assert.equal(row.cost, null);
+});
+
+test("mixed cache TTLs are billed without double counting", () => {
+  const row = usageRecord({ status: 200, text: JSON.stringify({
+    model: "claude-sonnet-5", usage: { cache_creation_input_tokens: 1000,
+      cache_creation: { ephemeral_5m_input_tokens: 400, ephemeral_1h_input_tokens: 600 } },
+  }) });
+  assert.equal(row.cacheCreate1h, 600);
+  assert.equal(row.cost, (400 * 2.5 + 600 * 4) / 1e6);
+  assert.equal(row.costEstimated, false);
+});
+
+test("advisor iterations add their own rates without duplicating executor totals", () => {
+  const row = usageRecord({ status: 200, text: JSON.stringify({
+    model: "claude-sonnet-5",
+    usage: { input_tokens: 1000, output_tokens: 200, iterations: [
+      { type: "message", input_tokens: 1000, output_tokens: 200 },
+      { type: "advisor_message", model: "claude-opus-5", input_tokens: 3000, output_tokens: 1000 },
+    ] },
+  }) });
+  assert.equal(row.executorCost, 0.004);
+  assert.equal(row.advisorCost, 0.04);
+  assert.equal(row.cost, 0.044);
+});
+
+test("unknown advisor prices propagate unknown total cost", () => {
+  const row = usageRecord({ text: JSON.stringify({ model: "claude-sonnet-5",
+    usage: { iterations: [{ type: "advisor_message", model: "unknown", input_tokens: 1 }] } }) });
+  assert.equal(row.cost, null);
+});
+
+test("incremental accounting handles arbitrary UTF-8 and SSE chunk boundaries", () => {
+  const text = 'event: message_start\r\ndata: {"message":{"model":"claude-sonnet-5","usage":{"input_tokens":42}}}\r\n\r\n' +
+    'event: content_block_delta\ndata: {"delta":{"text":"caf\\u00e9"}}\n\n' +
+    'data: {"type":"message_delta","usage":{"output_tokens":23}}\n\ndata: {"type":"message_stop"}\n\n';
+  const collector = createUsageCollector();
+  for (const byte of Buffer.from(text)) collector.write(Buffer.from([byte]));
+  const u = collector.finish();
+  assert.equal(u.input, 42);
+  assert.equal(u.output, 23);
+  assert.equal(u.complete, true);
+});
+
+test("negative or nonnumeric usage produces unknown cost", () => {
+  for (const input_tokens of [-1, "100", 0.5]) {
+    const row = usageRecord({ text: JSON.stringify({ model: "claude-sonnet-5", usage: { input_tokens } }) });
+    assert.equal(row.cost, null);
+  }
+});
+
+test("hour fallback is labeled as estimated when provider omits TTL detail", () => {
+  const row = usageRecord({ fallbackTtl: "1h",
+    text: '{"model":"claude-sonnet-5","usage":{"cache_creation_input_tokens":1000}}' });
+  assert.equal(row.cost, 0.004);
+  assert.equal(row.costEstimated, true);
 });
